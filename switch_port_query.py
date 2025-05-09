@@ -2,36 +2,44 @@
 """
 Project Title: SwitchPortQuery
 
-A CLI tool to retrieve switchport status across multiple devices and search specific switchport entries,
+A CLI tool to retrieve switchport status across multiple devices and search specific switchport entries,  # noqa
 with both command-line and interactive modes.
 
 Author: Kris Sales
 """
-__version__ = "1.1.0"
-
 from __future__ import annotations
+
+__version__ = "1.1.0"
 
 import argparse
 import logging
 import sys
 import re
 from logging.handlers import RotatingFileHandler
-from pysnmp.hlapi import (
-    SnmpEngine,
-    CommunityData,
-    UdpTransportTarget,
-    ContextData,
-    ObjectType,
-    ObjectIdentity,
-    getCmd,
-)
 
-# SNMP status mapping
-_STATUS_MAP: dict[int, str] = {
-    1: "up",
-    2: "down",
-    3: "testing",
-}
+# ─── SNMP IMPORTS ────────────────────────────────────────────────────────────────
+try:
+    from pysnmp.hlapi import (
+        SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
+        ObjectType, ObjectIdentity, getCmd
+    )
+except ImportError:
+    # allow import of cmd_find even if pysnmp is missing
+    SnmpEngine = CommunityData = UdpTransportTarget = ContextData = (
+        ObjectType, ObjectIdentity, getCmd
+    ) = None
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+class Config:
+    """Global constants for SwitchPortQuery."""
+
+    STATUS_MAP: dict[int, str] = {
+        1: "up",
+        2: "down",
+        3: "testing",
+    }
+
 
 def setup_logging(verbose: bool, logfile: str) -> None:
     """
@@ -43,14 +51,96 @@ def setup_logging(verbose: bool, logfile: str) -> None:
     """
     level = logging.DEBUG if verbose else logging.INFO
     handler = RotatingFileHandler(logfile, maxBytes=1_000_000, backupCount=3)
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
     handler.setFormatter(formatter)
 
     root = logging.getLogger()
     root.setLevel(level)
     root.addHandler(handler)
+
+
+def handle_exceptions(func, args, logger, verbose: bool) -> int:
+    """
+    Handle exceptions for CLI commands, logging errors and returning appropriate exit codes.
+
+    Args:
+        func: The function to execute (cmd_status or cmd_find).
+        args: Command-line arguments.
+        logger: Logger instance.
+        verbose: If True, include traceback in logs.
+
+    Returns:
+        Exit code (0 for success, 1 for errors).
+    """
+    try:
+        return func(args)
+    except KeyboardInterrupt:
+        logger.info("Cancelled by user")
+        return 0
+    except Exception as e:
+        logger.error("Fatal error: %s", e, exc_info=verbose)
+        return 1
+
+
+def handle_snmp_error(
+        error_indication, error_status, error_index, target_ip: str
+) -> None:
+    """
+    Handle SNMP errors and raise appropriate exceptions.
+
+    Args:
+        error_indication: SNMP error indication.
+        error_status: SNMP error status.
+        error_index: SNMP error index.
+        target_ip: Target IP address.
+
+    Raises:
+        ConnectionError: On SNMP connection issues.
+        TimeoutError: On SNMP timeout.
+        RuntimeError: On other SNMP errors.
+    """
+    if error_indication:
+        if "timeout" in str(error_indication).lower():
+            raise TimeoutError(f"SNMP timeout for {target_ip}")
+        raise ConnectionError(f"SNMP connection error: {error_indication}")
+    if error_status:
+        raise RuntimeError(
+            f"SNMP error: {error_status.prettyPrint()} at var {error_index}"
+        )
+
+
+def snmp_get(
+        engine: SnmpEngine, target_ip: str, community: str, *oids: ObjectType
+) -> list:
+    """
+    Perform an SNMP GET request for the given OIDs.
+
+    Args:
+        engine: Cached SnmpEngine instance.
+        target_ip: IP address of the target device.
+        community: SNMP community string.
+        oids: ObjectType instances to query.
+
+    Returns:
+        List of variable bindings.
+
+    Raises:
+        ConnectionError: On SNMP connection issues.
+        TimeoutError: On SNMP timeout.
+        RuntimeError: On other SNMP errors.
+    """
+    error_indication, error_status, error_index, var_binds = next(
+        getCmd(
+            engine,
+            CommunityData(community),
+            UdpTransportTarget((target_ip, 161), timeout=2, retries=1),
+            ContextData(),
+            *oids,
+        )
+    )
+    handle_snmp_error(error_indication, error_status, error_index, target_ip)
+    return var_binds
+
 
 def get_num_interfaces(engine: SnmpEngine, target_ip: str, community: str) -> int:
     """
@@ -69,30 +159,22 @@ def get_num_interfaces(engine: SnmpEngine, target_ip: str, community: str) -> in
         TimeoutError: On SNMP timeout.
         RuntimeError: On other SNMP errors.
     """
-    errorIndication, errorStatus, errorIndex, varBinds = next(
-        getCmd(
-            engine,
-            CommunityData(community),
-            UdpTransportTarget((target_ip, 161), timeout=2, retries=1),
-            ContextData(),
-            ObjectType(ObjectIdentity('IF-MIB', 'ifNumber')),
-        )
+
+    
+    var_binds = snmp_get(
+        engine,
+        target_ip,
+        community,
+        ObjectType(ObjectIdentity("IF-MIB", "ifNumber")),
     )
-    if errorIndication:
-        if "timeout" in str(errorIndication).lower():
-            raise TimeoutError(f"SNMP timeout for {target_ip}")
-        raise ConnectionError(f"SNMP connection error: {errorIndication}")
-    if errorStatus:
-        raise RuntimeError(
-            f"SNMP error: {errorStatus.prettyPrint()} at var {errorIndex}"
-        )
-    return int(varBinds[0][1])
+    return int(var_binds[0][1])
+
 
 def get_interface_status(
-    engine: SnmpEngine,
-    target_ip: str,
-    community: str,
-    interface_index: int,
+        engine: SnmpEngine,
+        target_ip: str,
+        community: str,
+        interface_index: int,
 ) -> tuple[str, str]:
     """
     Retrieve admin and oper status for a given interface index.
@@ -111,33 +193,35 @@ def get_interface_status(
         TimeoutError: On SNMP timeout.
         RuntimeError: On other SNMP errors.
     """
-    errorIndication, errorStatus, errorIndex, varBinds = next(
-        getCmd(
-            engine,
-            CommunityData(community),
-            UdpTransportTarget((target_ip, 161), timeout=2, retries=1),
-            ContextData(),
-            ObjectType(
-                ObjectIdentity('IF-MIB', 'ifAdminStatus', interface_index)
-            ),
-            ObjectType(
-                ObjectIdentity('IF-MIB', 'ifOperStatus', interface_index)
-            ),
-        )
+    var_binds = snmp_get(
+        engine,
+        target_ip,
+        community,
+        ObjectType(ObjectIdentity("IF-MIB", "ifAdminStatus", interface_index)),
+        ObjectType(ObjectIdentity("IF-MIB", "ifOperStatus", interface_index)),
     )
-    if errorIndication:
-        if "timeout" in str(errorIndication).lower():
-            raise TimeoutError(f"SNMP timeout for {target_ip}")
-        raise ConnectionError(f"SNMP connection error: {errorIndication}")
-    if errorStatus:
-        raise RuntimeError(
-            f"SNMP error: {errorStatus.prettyPrint()} at var {errorIndex}"
-        )
-    admin_val = int(varBinds[0][1])
-    oper_val = int(varBinds[1][1])
-    admin_str = _STATUS_MAP.get(admin_val, str(admin_val))
-    oper_str = _STATUS_MAP.get(oper_val, str(oper_val))
+    admin_val = int(var_binds[0][1])
+    oper_val = int(var_binds[1][1])
+    admin_str = Config.STATUS_MAP.get(admin_val, str(admin_val))  # noqa
+    oper_str = Config.STATUS_MAP.get(oper_val, str(oper_val))  # noqa
     return admin_str, oper_str
+
+
+def log_snmp_error(logger, host: str, idx: int | None, e: Exception) -> None:
+    """
+    Log SNMP errors with context.
+
+    Args:
+        logger: Logger instance.
+        host: Host IP or hostname.
+        idx: Interface index (if applicable, else None).
+        e: Exception to log.
+    """
+    if idx is None:
+        logger.error("Failed to connect to %s: %s", host, e)
+    else:
+        logger.error("Failed to connect for %s interface %d: %s", host, idx, e)
+
 
 def cmd_status(args: argparse.Namespace) -> int:
     """
@@ -156,7 +240,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         try:
             count = get_num_interfaces(engine, host, args.username)
         except (ConnectionError, TimeoutError) as e:
-            logger.error("Failed to connect to %s: %s", host, e)
+            log_snmp_error(logger, host, None, e)
             continue
         except RuntimeError as e:
             logger.error("Failed to get interface count for %s: %s", host, e)
@@ -165,16 +249,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         for idx in range(1, count + 1):
             try:
                 admin, oper = get_interface_status(engine, host, args.username, idx)
-                print(f"  Interface {idx}: Admin={admin}, Oper={oper}")
+                print(f"  Interface {idx}: Admin={admin}, Oper={oper}")  # noqa
             except (ConnectionError, TimeoutError) as e:
-                logger.error("Failed to connect for %s interface %d: %s", host, idx, e)
+                log_snmp_error(logger, host, idx, e)
             except RuntimeError as e:
-                logger.error("Error retrieving status for %s interface %d: %s", host, idx, e)
+                logger.error(
+                    "Error retrieving status for %s interface %d: %s", host, idx, e
+                )
     return 0
+
 
 def cmd_find(args: argparse.Namespace) -> int:
     """
-    Handle the 'find' subcommand: search within a switchport output file.
+    Handle the 'find' subcommand: search within a switchport output file.  # noqa
 
     Args:
         args: Parsed command-line arguments.
@@ -184,7 +271,7 @@ def cmd_find(args: argparse.Namespace) -> int:
     """
     logger = logging.getLogger(__name__)
     try:
-        with open(args.input_file, encoding='utf-8') as f:
+        with open(args.input_file, encoding="utf-8") as f:
             lines = f.readlines()
     except FileNotFoundError:
         logger.error("Input file not found: %s", args.input_file)
@@ -192,14 +279,15 @@ def cmd_find(args: argparse.Namespace) -> int:
     except PermissionError:
         logger.error("Permission denied for file: %s", args.input_file)
         return 1
-    print(f"Searching for '{args.search}' in {args.input_file}...")
+    print(f"Searching for '{args.search}' in {args.input_file}...")  # noqa
     matches = [line.rstrip() for line in lines if args.search in line]
     if not matches:
         print("No matches found.")
     else:
         for m in matches:
-            print(m)
+            print(m)  # noqa
     return 0
+
 
 def interactive_mode(verbose: bool, logfile: str) -> argparse.Namespace:
     """
@@ -239,7 +327,7 @@ def interactive_mode(verbose: bool, logfile: str) -> argparse.Namespace:
             verbose=verbose,
             logfile=logfile,
         )
-    infile = input("Enter path to switchport output file: ").strip()
+    infile = input("Enter path to switchport output file: ").strip()  # noqa
     if not infile:
         print("Input file cannot be empty.")
         infile = "output.txt"
@@ -255,6 +343,28 @@ def interactive_mode(verbose: bool, logfile: str) -> argparse.Namespace:
         logfile=logfile,
     )
 
+
+def setup_subparser(
+        subparsers: argparse._SubParsersAction,  # type: ignore
+        name: str,
+        help_text: str,
+        args: list[tuple[str, dict]],
+) -> None:
+    """
+    Set up a subparser with the given arguments.
+
+    Args:
+        subparsers: Subparsers object to add to.
+        name: Name of the subcommand.
+        help_text: Help text for the subcommand.
+        args: List of (flag, kwargs) tuples for arguments.
+    """
+    parser = subparsers.add_parser(name, help=help_text)
+    for flag, kwargs in args:
+        parser.add_argument(flag, **kwargs)
+    parser.set_defaults(func=globals()[f"cmd_{name}"])
+
+
 def main() -> None:
     """
     Parse command-line arguments or launch interactive mode, then dispatch.
@@ -267,73 +377,71 @@ def main() -> None:
         description="SwitchPortQuery CLI: 'status' and 'find' operations"
     )
     parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Enable debug logging"
+        "--verbose", "-v", action="store_true", help="Enable debug logging"
     )
     parser.add_argument(
         "--logfile",
         default="switch_port_query.log",
-        help="Path to log file (default: switch_port_query.log)"
+        help="Path to log file (default: switch_port_query.log)",
     )
     parser.add_argument(
-        "--interactive", "-i",
+        "--interactive",
+        "-i",
         action="store_true",
-        help="Enable interactive prompt mode"
+        help="Enable interactive prompt mode",
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = False
 
     # 'status' subcommand
-    parser_status = subparsers.add_parser(
+    setup_subparser(
+        subparsers,
         "status",
-        help="Retrieve switchport status from devices"
+        "Retrieve switchport status from devices",  # noqa
+        [
+            (
+                "--hosts",
+                {
+                    "nargs": "+",
+                    "required": False,
+                    "help": "List of host IPs or hostnames to query",
+                },
+            ),
+            (
+                "--username",
+                {
+                    "help": "SNMP community string (default 'public')",
+                    "default": "public",
+                },
+            ),
+        ],
     )
-    parser_status.add_argument(
-        "--hosts",
-        nargs="+",
-        required=False,
-        help="List of host IPs or hostnames to query"
-    )
-    parser_status.add_argument(
-        "--username",
-        help="SNMP community string (default 'public')",
-        default="public"
-    )
-    parser_status.set_defaults(func=cmd_status)
 
     # 'find' subcommand
-    parser_find = subparsers.add_parser(
+    setup_subparser(
+        subparsers,
         "find",
-        help="Find specific switchport entries"
+        "Find specific switchport entries",  # noqa
+        [
+            (
+                "--input-file",
+                {"help": "Path to switchport output file", "required": False},  # noqa
+            ),
+            (
+                "--search",
+                {"help": "Search term or port identifier to find", "required": False},
+            ),
+        ],
     )
-    parser_find.add_argument(
-        "--input-file",
-        help="Path to switchport output file",
-        required=False
-    )
-    parser_find.add_argument(
-        "--search",
-        help="Search term or port identifier to find",
-        required=False
-    )
-    parser_find.set_defaults(func=cmd_find)
 
     args, _ = parser.parse_known_args()
     if args.interactive:
         args = interactive_mode(args.verbose, args.logfile)
     setup_logging(args.verbose, args.logfile)
     logger = logging.getLogger(__name__)
-    try:
-        exit_code = args.func(args)  # type: ignore
-    except KeyboardInterrupt:
-        logger.info("Cancelled by user")
-        sys.exit(0)
-    except Exception as e:
-        logger.error("Fatal error: %s", e, exc_info=args.verbose)
-        sys.exit(1)
-    else:
-        sys.exit(exit_code)
+    exit_code = handle_exceptions(args.func, args, logger, args.verbose)
+    sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()
